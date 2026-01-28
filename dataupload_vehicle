@@ -1,0 +1,658 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <openssl/sha.h>
+#include <openssl/aes.h>
+#include <openssl/rand.h>
+
+#define M_V_STR "f1e2d3c4b5a697889a0bc0cd11223344"
+#define PID_V_STR "99887766554433221100aabbccddeeff"
+#define PQK_OV_STR "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+#define W 8
+#define OEM_IP "192.168.225.48" 
+#define OEM_PORT 8888
+
+unsigned char M_V[16];
+unsigned char PID_V[16];
+unsigned char PQK_OV[32];
+unsigned char PQK_OV_tag[SHA256_DIGEST_LENGTH];
+unsigned char vehicle_h_ct[SHA256_DIGEST_LENGTH]; // 存储Vehicle计算的H(C_T)
+
+typedef struct {
+    uint32_t msg_v1_len;
+    uint32_t mac_v1_len;
+    unsigned char *msg_v1;
+    unsigned char *mac_v1;
+} VehicleDataPacket;
+
+// OEM响应结构
+typedef struct {
+    unsigned char *ec;  // 加密的H(C_T)
+    int ec_len;
+    time_t t3;
+    unsigned char *mac_o1;
+    int mac_o1_len;
+} OemResponse;
+
+// 新增辅助函数：接收OEM响应
+OemResponse* receive_oem_response(int sock);
+void free_oem_response(OemResponse *response);
+int send_final_message(int sock, const char *message);
+int send_all(int sock, void *buf, size_t len);
+int recv_all(int sock, void *buf, size_t len);
+
+void print_hex(const char *label, unsigned char *data, size_t len) {
+    printf("%s:", label);
+    for (size_t i = 0; i < len; i++) {
+        printf("%02x", data[i]);
+    }
+    printf("\n");
+}
+
+void generate_random_bytes(unsigned char *buf, size_t len) {
+    if (RAND_bytes(buf, len) != 1) {
+        fprintf(stderr, "Error generating random bytes\n");
+        exit(1);
+    }
+}
+
+void Split(unsigned char *m, size_t w, unsigned char m_grape[W][64]) {
+    for (size_t i = 0; i < w; i++) {
+        memcpy(m_grape[i], m + (i * 64), 64);
+    }
+}
+
+void KeyGen(unsigned char *k_root, unsigned char K_grape[W][SHA256_DIGEST_LENGTH]) {
+    unsigned char k_current[SHA256_DIGEST_LENGTH];
+    memcpy(k_current, k_root, SHA256_DIGEST_LENGTH);
+    
+    for (int i = 0; i < W; i++) {
+        SHA256(k_current, SHA256_DIGEST_LENGTH, k_current);
+        memcpy(K_grape[i], k_current, SHA256_DIGEST_LENGTH);
+    }
+}
+
+int c_structure_length(int i) {
+    if (i == 1) return 16 + 64;
+    return 16 + (c_structure_length(i-1) + 64);
+}
+
+void Encrypt_correct_chain(unsigned char m_grape[W][64], 
+                          unsigned char K_grape[W][SHA256_DIGEST_LENGTH], 
+                          unsigned char **c_structure,
+                          unsigned char *c_final) {
+    AES_KEY aes_key;
+    
+    for (int i = 0; i < W; i++) {
+        int len = c_structure_length(i+1);
+        c_structure[i] = malloc(len);
+    }
+    
+    for (int i = 0; i < W; i++) {
+        unsigned char iv[AES_BLOCK_SIZE];
+        generate_random_bytes(iv, AES_BLOCK_SIZE);
+        
+        AES_set_encrypt_key(K_grape[i], 256, &aes_key);
+        
+        memcpy(c_structure[i], iv, 16); 
+
+        if (i == 0) {
+            int cipher_len = 64;
+            AES_cbc_encrypt(m_grape[i], c_structure[i] + 16, cipher_len, &aes_key, iv, AES_ENCRYPT);
+        } else {
+            int prev_len = c_structure_length(i);
+            int input_len = prev_len + 64;
+            
+            unsigned char *input = malloc(input_len);
+            memcpy(input, c_structure[i-1], prev_len);
+            memcpy(input + prev_len, m_grape[i], 64);
+            
+            AES_cbc_encrypt(input, c_structure[i] + 16, input_len, &aes_key, iv, AES_ENCRYPT);
+            
+            free(input);
+        }
+    }
+    memcpy(c_final, c_structure[W-1], c_structure_length(W));
+}
+
+VehicleDataPacket* create_vehicle_data_packet(unsigned char *EC_T, int ec_t_len, 
+                                              time_t T_1, unsigned char *PQK_OV_tag,
+                                              unsigned char *MAC_V1) {
+    VehicleDataPacket *packet = malloc(sizeof(VehicleDataPacket));
+    
+    int msg_v1_len = ec_t_len + 8 + SHA256_DIGEST_LENGTH;
+    packet->msg_v1 = malloc(msg_v1_len);
+    packet->msg_v1_len = msg_v1_len;
+    
+    memcpy(packet->msg_v1, EC_T, ec_t_len);
+    
+    for (int i = 0; i < 8; i++) {
+        packet->msg_v1[ec_t_len + 7 - i] = (T_1 >> (8 * i)) & 0xFF;
+    }
+    
+    memcpy(packet->msg_v1 + ec_t_len + 8, PQK_OV_tag, SHA256_DIGEST_LENGTH);
+    
+    packet->mac_v1 = malloc(SHA256_DIGEST_LENGTH);
+    packet->mac_v1_len = SHA256_DIGEST_LENGTH;
+    memcpy(packet->mac_v1, MAC_V1, SHA256_DIGEST_LENGTH);
+    
+    return packet;
+}
+
+int send_to_oem(VehicleDataPacket *packet) {
+    int sock = 0;
+    struct sockaddr_in serv_addr;
+    
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("Socket creation error\n");
+        return -1;
+    }
+    
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(OEM_PORT);
+    
+    if (inet_pton(AF_INET, OEM_IP, &serv_addr.sin_addr) <= 0) {
+        printf("Invalid address/ Address not supported\n");
+        close(sock);
+        return -1;
+    }
+    
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        printf("Connection Failed\n");
+        close(sock);
+        return -1;
+    }
+    
+    uint32_t net_msg_v1_len = htonl(packet->msg_v1_len);
+    uint32_t net_mac_v1_len = htonl(packet->mac_v1_len);
+    
+    if (send_all(sock, &net_msg_v1_len, sizeof(net_msg_v1_len)) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    if (send_all(sock, packet->msg_v1, packet->msg_v1_len) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    if (send_all(sock, &net_mac_v1_len, sizeof(net_mac_v1_len)) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    if (send_all(sock, packet->mac_v1, packet->mac_v1_len) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    return sock; // 返回socket以便后续通信
+}
+
+void free_vehicle_data_packet(VehicleDataPacket *packet) {
+    if (packet) {
+        if (packet->msg_v1) free(packet->msg_v1);
+        if (packet->mac_v1) free(packet->mac_v1);
+        free(packet);
+    }
+}
+
+// 接收OEM响应
+OemResponse* receive_oem_response(int sock) {
+    OemResponse *response = malloc(sizeof(OemResponse));
+    
+    // 接收Msg_O1长度
+    uint32_t net_msg_o1_len;
+    if (recv_all(sock, &net_msg_o1_len, sizeof(net_msg_o1_len)) < 0) {
+        free(response);
+        return NULL;
+    }
+    int msg_o1_len = ntohl(net_msg_o1_len);
+    
+    // 接收Msg_O1
+    unsigned char *msg_o1 = malloc(msg_o1_len);
+    if (recv_all(sock, msg_o1, msg_o1_len) < 0) {
+        free(msg_o1);
+        free(response);
+        return NULL;
+    }
+    
+    // 接收MAC_O1长度
+    uint32_t net_mac_o1_len;
+    if (recv_all(sock, &net_mac_o1_len, sizeof(net_mac_o1_len)) < 0) {
+        free(msg_o1);
+        free(response);
+        return NULL;
+    }
+    response->mac_o1_len = ntohl(net_mac_o1_len);
+    
+    // 接收MAC_O1
+    response->mac_o1 = malloc(response->mac_o1_len);
+    if (recv_all(sock, response->mac_o1, response->mac_o1_len) < 0) {
+        free(msg_o1);
+        free(response->mac_o1);
+        free(response);
+        return NULL;
+    }
+    
+    // 解析Msg_O1 = Ec || T_3
+    // Ec = IV (16字节) + ciphertext
+    response->ec_len = msg_o1_len - 8;
+    response->ec = malloc(response->ec_len);
+    memcpy(response->ec, msg_o1, response->ec_len);
+    
+    // 解析T_3
+    response->t3 = 0;
+    unsigned char *t3_ptr = msg_o1 + response->ec_len;
+    for (int i = 0; i < 8; i++) {
+        response->t3 = (response->t3 << 8) | t3_ptr[i];
+    }
+    
+    free(msg_o1);
+    return response;
+}
+
+void free_oem_response(OemResponse *response) {
+    if (response) {
+        if (response->ec) free(response->ec);
+        if (response->mac_o1) free(response->mac_o1);
+        free(response);
+    }
+}
+
+int send_final_message(int sock, const char *message) {
+    return send_all(sock, message, strlen(message));
+}
+
+int send_all(int sock, void *buf, size_t len) {
+    size_t total_sent = 0;
+    size_t bytes_left = len;
+    char *ptr = (char *)buf;
+
+    while (total_sent < len) {
+        ssize_t sent = send(sock, ptr + total_sent, bytes_left, 0);
+        if (sent <= 0) {
+            return -1;
+        }
+        total_sent += sent;
+        bytes_left -= sent;
+    }
+    return 0;
+}
+
+int recv_all(int sock, void *buf, size_t len) {
+    size_t total_received = 0;
+    size_t bytes_left = len;
+    char *ptr = (char *)buf;
+
+    while (total_received < len) {
+        ssize_t received = recv(sock, ptr + total_received, bytes_left, 0);
+        if (received <= 0) {
+            return -1;
+        }
+        total_received += received;
+        bytes_left -= received;
+    }
+    return 0;
+}
+
+// 处理OEM响应
+int process_oem_response(int sock, OemResponse *response) {
+    printf("\n=== PROCESSING OEM RESPONSE ===\n");
+    
+    // 生成时间戳T_4
+    time_t t4 = time(NULL);
+    printf("T_4: %ld\n", t4);
+    
+    // 验证消息实时性
+    long time_diff = t4 - response->t3;
+    printf("Time difference (T_4 - T_3): %ld seconds\n", time_diff);
+    
+    if (time_diff > 1) {  // 超过1秒
+        printf("ERROR: Message timeout!\n");
+        return send_final_message(sock, "消息超时");
+    }
+    
+    printf("Message timeliness verification PASSED\n");
+    
+    // 构建Msg_O1用于验证MAC
+    int msg_o1_len = response->ec_len + 8;
+    unsigned char *msg_o1 = malloc(msg_o1_len);
+    memcpy(msg_o1, response->ec, response->ec_len);
+    
+    for (int i = 0; i < 8; i++) {
+        msg_o1[response->ec_len + 7 - i] = (response->t3 >> (8 * i)) & 0xFF;
+    }
+    
+    // 计算MAC_O1' = H(Msg_O1 || PQK_OV)
+    int msg_o1_with_pqk_len = msg_o1_len + 32;
+    unsigned char *msg_o1_with_pqk = malloc(msg_o1_with_pqk_len);
+    memcpy(msg_o1_with_pqk, msg_o1, msg_o1_len);
+    memcpy(msg_o1_with_pqk + msg_o1_len, PQK_OV, 32);
+    
+    unsigned char calculated_mac_o1[SHA256_DIGEST_LENGTH];
+    SHA256(msg_o1_with_pqk, msg_o1_with_pqk_len, calculated_mac_o1);
+    
+    printf("Calculated MAC_O1':\n");
+    print_hex("  ", calculated_mac_o1, SHA256_DIGEST_LENGTH);
+    
+    printf("Received MAC_O1:\n");
+    print_hex("  ", response->mac_o1, response->mac_o1_len);
+    
+    // 验证MAC_O1
+    int mac_match = 1;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        if (calculated_mac_o1[i] != response->mac_o1[i]) {
+            mac_match = 0;
+            break;
+        }
+    }
+    
+    free(msg_o1);
+    free(msg_o1_with_pqk);
+    
+    if (!mac_match) {
+        printf("ERROR: MAC_O1 verification failed!\n");
+        return send_final_message(sock, "消息丢失");
+    }
+    
+    printf("Message integrity verification PASSED\n");
+    
+    // 解密Ec得到H(C_T)'
+    unsigned char *iv = response->ec;
+    unsigned char *encrypted_h_ct = response->ec + AES_BLOCK_SIZE;
+    int encrypted_len = response->ec_len - AES_BLOCK_SIZE;
+    
+    AES_KEY aes_key_dec;
+    AES_set_decrypt_key(PQK_OV, 256, &aes_key_dec);
+    
+    unsigned char *decrypted_h_ct_padded = malloc(encrypted_len);
+    unsigned char iv_temp[AES_BLOCK_SIZE];
+    memcpy(iv_temp, iv, AES_BLOCK_SIZE);
+    AES_cbc_encrypt(encrypted_h_ct, decrypted_h_ct_padded, encrypted_len, &aes_key_dec, iv_temp, AES_DECRYPT);
+    
+    int padding_len = decrypted_h_ct_padded[encrypted_len - 1];
+    int actual_h_ct_len = encrypted_len - padding_len;
+    
+    if (actual_h_ct_len != SHA256_DIGEST_LENGTH) {
+        printf("ERROR: Decrypted H(C_T) length mismatch\n");
+        free(decrypted_h_ct_padded);
+        return send_final_message(sock, "消息丢失");
+    }
+    
+    unsigned char decrypted_h_ct[SHA256_DIGEST_LENGTH];
+    memcpy(decrypted_h_ct, decrypted_h_ct_padded, SHA256_DIGEST_LENGTH);
+    free(decrypted_h_ct_padded);
+    
+    printf("Decrypted H(C_T) from OEM:\n");
+    print_hex("  ", decrypted_h_ct, SHA256_DIGEST_LENGTH);
+    
+    printf("Vehicle's original H(C_T):\n");
+    print_hex("  ", vehicle_h_ct, SHA256_DIGEST_LENGTH);
+    
+    // 验证H(C_T)是否相等
+    int h_ct_match = 1;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        if (decrypted_h_ct[i] != vehicle_h_ct[i]) {
+            h_ct_match = 0;
+            break;
+        }
+    }
+    
+    if (!h_ct_match) {
+        printf("ERROR: H(C_T) verification failed! Vehicle needs to resend data.\n");
+        return send_final_message(sock, "RESEND");
+    }
+    
+    printf("H(C_T) verification PASSED\n");
+    
+    // 最终成功
+    return send_final_message(sock, "SUCCESS");
+}
+
+int main() {
+    printf("=== Vehicle System Starting ===\n");
+    
+    // 初始化参数
+    for (int i = 0; i < 16; i++) {
+        char byte_str[3] = {M_V_STR[i*2], M_V_STR[i*2+1], '\0'};
+        M_V[i] = strtol(byte_str, NULL, 16);
+    }
+    
+    for (int i = 0; i < 16; i++) {
+        char byte_str[3] = {PID_V_STR[i*2], PID_V_STR[i*2+1], '\0'};
+        PID_V[i] = strtol(byte_str, NULL, 16);
+    }
+    
+    for (int i = 0; i < 32; i++) {
+        char byte_str[3] = {PQK_OV_STR[i*2], PQK_OV_STR[i*2+1], '\0'};
+        PQK_OV[i] = strtol(byte_str, NULL, 16);
+    }
+
+    SHA256(PQK_OV, 32, PQK_OV_tag);
+
+    printf("\n1. Vehicle预定义参数:\n");
+    printf("   M_V: f1e2d3c4b5a697889a0bc0cd11223344\n");
+    printf("   PID_V: 99887766554433221100aabbccddeeff\n");
+    printf("   PQK_OV: ");
+    for (int i = 0; i < 32; i++) printf("%02x", PQK_OV[i]);
+    printf("\n");
+    printf("   PQK_OV_tag: ");
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) printf("%02x", PQK_OV_tag[i]);
+    printf("\n");
+
+    time_t T_c = time(NULL);
+    printf("\n2. 生成时间戳T_c: %ld\n", T_c);
+
+    unsigned char m[64 * W];
+    generate_random_bytes(m, sizeof(m));
+
+    unsigned char m_grape[W][64];
+    Split(m, W, m_grape);
+    
+    unsigned char k_root[SHA256_DIGEST_LENGTH];
+    generate_random_bytes(k_root, sizeof(k_root));
+
+    unsigned char K_grape[W][SHA256_DIGEST_LENGTH];
+    KeyGen(k_root, K_grape);
+    
+    int AL_O = 5;
+
+    unsigned char **c_structure = malloc(W * sizeof(unsigned char *));
+    unsigned char c_final[640];
+    
+    Encrypt_correct_chain(m_grape, K_grape, c_structure, c_final);
+    
+    int c_len = c_structure_length(W);
+    unsigned char *C_T = malloc(c_len + 8 + SHA256_DIGEST_LENGTH);
+    int C_T_len = 0;
+    
+    memcpy(C_T, c_final, c_len);
+    C_T_len += c_len;
+    
+    unsigned char time_bytes[8];
+    for (int i = 0; i < 8; i++) {
+        time_bytes[7-i] = (T_c >> (8*i)) & 0xFF;
+    }
+    memcpy(C_T + C_T_len, time_bytes, 8);
+    C_T_len += 8;
+    
+    memcpy(C_T + C_T_len, K_grape[AL_O-1], SHA256_DIGEST_LENGTH);
+    C_T_len += SHA256_DIGEST_LENGTH;
+    
+    // 计算并保存H(C_T)
+    SHA256(C_T, C_T_len, vehicle_h_ct);
+    
+    printf("\n3. 生成的C_T (长度=%d):\n", C_T_len);
+    print_hex("   C_T", C_T, C_T_len > 128 ? 128 : C_T_len);
+    
+    printf("\n4. 计算的H(C_T):\n");
+    print_hex("   H(C_T)", vehicle_h_ct, SHA256_DIGEST_LENGTH);
+    
+    unsigned char *to_encrypt = malloc(16 + 16 + C_T_len);
+    int to_encrypt_len = 0;
+    
+    memcpy(to_encrypt, PID_V, 16);
+    to_encrypt_len += 16;
+    
+    memcpy(to_encrypt + to_encrypt_len, M_V, 16);
+    to_encrypt_len += 16;
+    
+    memcpy(to_encrypt + to_encrypt_len, C_T, C_T_len);
+    to_encrypt_len += C_T_len;
+    
+    AES_KEY aes_key_enc;
+    unsigned char iv_enc[AES_BLOCK_SIZE];
+    generate_random_bytes(iv_enc, AES_BLOCK_SIZE);
+    
+    unsigned char iv_temp[AES_BLOCK_SIZE];
+    memcpy(iv_temp, iv_enc, AES_BLOCK_SIZE);
+    
+    AES_set_encrypt_key(PQK_OV, 256, &aes_key_enc);
+    
+    int padding_len = AES_BLOCK_SIZE - (to_encrypt_len % AES_BLOCK_SIZE);
+    if (padding_len == 0) padding_len = AES_BLOCK_SIZE;
+    
+    int encrypted_len = to_encrypt_len + padding_len;
+    unsigned char *padded_data = malloc(encrypted_len);
+    
+    memcpy(padded_data, to_encrypt, to_encrypt_len);
+    for (int i = 0; i < padding_len; i++) {
+        padded_data[to_encrypt_len + i] = padding_len;
+    }
+    
+    unsigned char *ciphertext = malloc(encrypted_len);
+    AES_cbc_encrypt(padded_data, ciphertext, encrypted_len, &aes_key_enc, iv_temp, AES_ENCRYPT);
+    
+    free(padded_data);
+    
+    unsigned char *EC_T = malloc(AES_BLOCK_SIZE + encrypted_len);
+    memcpy(EC_T, iv_enc, AES_BLOCK_SIZE);
+    memcpy(EC_T + AES_BLOCK_SIZE, ciphertext, encrypted_len);
+    
+    int ec_t_len = AES_BLOCK_SIZE + encrypted_len;
+    
+    time_t T_1 = time(NULL);
+    printf("\n5. 生成时间戳T_1: %ld\n", T_1);
+    
+    unsigned char *Msg_V1 = malloc(AES_BLOCK_SIZE + encrypted_len + 8 + SHA256_DIGEST_LENGTH);
+    int Msg_V1_len = 0;
+    
+    memcpy(Msg_V1, EC_T, AES_BLOCK_SIZE + encrypted_len);
+    Msg_V1_len += (AES_BLOCK_SIZE + encrypted_len);
+    
+    for (int i = 0; i < 8; i++) {
+        Msg_V1[Msg_V1_len + 7-i] = (T_1 >> (8*i)) & 0xFF;
+    }
+    Msg_V1_len += 8;
+    
+    memcpy(Msg_V1 + Msg_V1_len, PQK_OV_tag, SHA256_DIGEST_LENGTH);
+    Msg_V1_len += SHA256_DIGEST_LENGTH;
+    
+    unsigned char *Msg_V1_with_PQK_OV = malloc(Msg_V1_len + 32);
+    memcpy(Msg_V1_with_PQK_OV, Msg_V1, Msg_V1_len);
+    memcpy(Msg_V1_with_PQK_OV + Msg_V1_len, PQK_OV, 32);
+    
+    unsigned char MAC_V1[SHA256_DIGEST_LENGTH];
+    SHA256(Msg_V1_with_PQK_OV, Msg_V1_len + 32, MAC_V1);
+    
+    printf("\n6. 计算的MAC_V1:\n");
+    print_hex("   MAC_V1", MAC_V1, SHA256_DIGEST_LENGTH);
+    
+    printf("\n7. 构建Msg_V1 = EC_T || T_1 || PQK_OV_tag:\n");
+    print_hex("   Msg_V1", Msg_V1, Msg_V1_len > 128 ? 128 : Msg_V1_len);
+    
+    printf("\n8. 准备发送数据到OEM...\n");
+    VehicleDataPacket *packet = create_vehicle_data_packet(EC_T, ec_t_len, T_1, PQK_OV_tag, MAC_V1);
+    
+    int retry_count = 0;
+    int max_retries = 3;
+    
+    while (retry_count < max_retries) {
+        int sock = send_to_oem(packet);
+        if (sock < 0) {
+            printf("Failed to connect to OEM server.\n");
+            break;
+        }
+        
+        printf("数据发送成功到OEM服务器\n");
+        
+        // 接收OEM响应
+        OemResponse *response = receive_oem_response(sock);
+        if (response) {
+            printf("\n9. 接收到OEM响应:\n");
+            printf("   T_3: %ld\n", response->t3);
+            printf("   Ec长度: %d字节\n", response->ec_len);
+            printf("   MAC_O1:\n");
+            print_hex("      MAC_O1", response->mac_o1, response->mac_o1_len);
+            
+            // 处理OEM响应
+            printf("\n10. 处理OEM响应:\n");
+            int result = process_oem_response(sock, response);
+            
+            if (result >= 0) {
+                // 如果结果是SUCCESS
+                char final_msg[256] = {0};
+                int valread = read(sock, final_msg, sizeof(final_msg) - 1);
+                if (valread > 0) {
+                    printf("\n11. OEM最终响应: %s\n", final_msg);
+                }
+                
+                if (strcmp(final_msg, "SUCCESS") == 0) {
+                    printf("\n========================================\n");
+                    printf("=== 数据上传成功 ===\n");
+                    printf("储存 {k_root || T_c}\n");
+                    printf("k_root: ");
+                    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+                        printf("%02x", k_root[i]);
+                    }
+                    printf("\nT_c: %ld\n", T_c);
+                    printf("========================================\n");
+                    
+                    free_oem_response(response);
+                    close(sock);
+                    break;
+                } else if (strcmp(final_msg, "RESEND") == 0) {
+                    printf("\nOEM请求重新发送数据。正在重试...\n");
+                    retry_count++;
+                    close(sock);
+                    sleep(1); // 等待1秒后重试
+                    continue;
+                }
+            }
+            
+            free_oem_response(response);
+        } else {
+            printf("接收OEM响应失败\n");
+        }
+        
+        close(sock);
+        break;
+    }
+    
+    if (retry_count >= max_retries) {
+        printf("\n达到最大重试次数。数据上传失败。\n");
+    }
+    
+    // 清理资源
+    free_vehicle_data_packet(packet);
+    
+    for (int i = 0; i < W; i++) {
+        free(c_structure[i]);
+    }
+    free(c_structure);
+    
+    free(C_T);
+    free(to_encrypt);
+    free(ciphertext);
+    free(EC_T);
+    free(Msg_V1);
+    free(Msg_V1_with_PQK_OV);
+
+    printf("\n=== Vehicle System Finished ===\n");
+    return 0;
+}
